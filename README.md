@@ -1,4 +1,4 @@
-## Managed ERC-20 token - sample starter
+## Managed ERC-20 token - Example
 
 **Managed ERC-20 token that can be upgraded via ERC-1967**
 

@@ -8,16 +8,18 @@
 * Fully tested. Production grade.
     * Code coverage report in place.
     * Unit tests in place.
+    * Github workflow in place.
 
 * Code strength.
-    * [Static] Code & vulnerabilities analysis handled by Slither
-    * [AI] Dynamic code analysis handled by Cursor and Claude.
+    * Static code vulnerabilities analysis handled by Slither.
+    * Dynamic code analysis handled by Cursor.
 
 * Well documented code.
     * [Docs] Documentation available in the docs folder for end users.
     * [Docs] Documentation can be generated automatically by running `npm run docs`
 
-* Code flattening in place, for further deployment. (see flat folder)
+* Flattened contracts located in the "/flat" directory.
+* ABIs located in the "/abi" directory.
 
 ## Documentation
 
@@ -32,12 +34,53 @@ The circulating supply is controlled by a specific minter and burner, for the sa
 $ forge build
 ```
 
-### Test
+### Local Testing
 
 ```shell
 $ forge test
 ```
 
+### Generate test coverage report:
+
+```shell
+$ npm run coverage
+```
+
+### Static code analysis report:
+
+```shell
+$ npm run slither
+```
+
+or
+
+```shell
+$ slither .
+```
+
+### Testing on the Ethereum MainNet
+
+```shell
+$ npm run test-main
+```
+
+### Testing on Arbitrum
+
+```shell
+$ npm run test-arb
+```
+
+### Testing on Binance
+
+```shell
+$ npm run test-binance
+```
+
+### Testing on Avalanche
+
+```shell
+$ npm run test-avalanche
+```
 
 ### Deploy
 

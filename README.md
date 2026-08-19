@@ -31,60 +31,66 @@ The circulating supply is controlled by a specific minter and burner, for the sa
 ### Build
 
 ```shell
-$ forge build
+forge build
 ```
 
 ### Local Testing
 
 ```shell
-$ forge test
+forge test
 ```
 
 ### Generate test coverage report:
 
 ```shell
-$ npm run coverage
+npm run coverage
 ```
 
 ### Static code analysis report:
 
 ```shell
-$ npm run slither
+npm run slither
 ```
 
 or
 
 ```shell
-$ slither .
+slither .
 ```
 
 ### Testing on the Ethereum MainNet
 
 ```shell
-$ npm run test-main
+npm run test-main
 ```
 
 ### Testing on Arbitrum
 
 ```shell
-$ npm run test-arb
+npm run test-arb
 ```
 
 ### Testing on Binance
 
 ```shell
-$ npm run test-binance
+npm run test-binance
 ```
 
 ### Testing on Avalanche
 
 ```shell
-$ npm run test-avalanche
+npm run test-avalanche
+```
+
+### Testing on Optimism
+
+```shell
+npm run test-opti
 ```
 
 ### Deploy
 
 ```shell
-$ forge script script/ManagedErc20.s.sol:ManagedErc20Script --rpc-url <your_rpc_url> --private-key <your_private_key>
+forge script script/ManagedErc20.s.sol:ManagedErc20Script --rpc-url <your_rpc_url> --private-key <your_private_key>
 ```
 

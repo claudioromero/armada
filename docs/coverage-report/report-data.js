@@ -1,0 +1,1 @@
+window.REPORT_DATE = 'Wed Aug 19 2026 05:18:15 GMT+0000 (Coordinated Universal Time)';window.COVERAGE_DATA = {"src/ManagedErc20.sol":{"metrics":{"lines":{"total":28,"covered":28},"functions":{"total":6,"covered":6},"branches":{"total":10,"covered":9}},"path":"src/ManagedErc20.sol","filename":"ManagedErc20.sol"}};

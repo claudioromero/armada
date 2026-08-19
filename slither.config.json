@@ -1,0 +1,11 @@
+{
+    "filter_paths": "(node_modules/|lib/|test/|flat/)",
+    "exclude_informational": false,
+    "exclude_high": false,
+    "exclude_medium": false,
+    "exclude_low": false,
+    "disable_color": false,
+    "solc_remaps": [
+        "test/=test/"
+    ]
+}

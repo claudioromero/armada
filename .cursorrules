@@ -1,0 +1,5 @@
+# Solidity Security Rules
+- Check for common vulnerabilities: Reentrancy, Integer Overflow/Underflow, Front-running, and Denial of Service (DoS).
+- Enforce explicit function visibility modifiers (public, external, internal, private).
+- Ensure all external calls adhere to the Checks-Effects-Interactions pattern.
+- Verify correct use of custom errors instead of long require string messages.

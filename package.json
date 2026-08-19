@@ -1,0 +1,24 @@
+{
+  "name": "armada",
+  "version": "1.0.0",
+  "description": "Armada - Smart Contracts",
+  "author": "Claudio Romero",
+  "license": "MIT",
+  "engines": {
+    "node": ">= 16.14.2"
+  },
+  "scripts": {
+    "docs": "forge doc",
+    "abis": "forge build --extra-output-files abi",
+    "test-arb": "forge test --fork-url \"https://arb1.arbitrum.io/rpc\" -vvv",
+    "test-avalanche": "forge test --fork-url \"https://api.avax.network/ext/bc/C/rpc\" -vvv",
+    "test-binance": "forge test --fork-url \"https://bsc-dataseed.binance.org/\" -vvv",
+    "test-opti": "forge test --fork-url \"https://mainnet.optimism.io/\" -vvv",
+    "coverage": "forge coverage --skip script --optimize --optimizer-runs 200 --fork-url \"https://arb1.arbitrum.io/rpc\" -vvv --report lcov && lcov-viewer lcov -o ./docs/coverage-report ./lcov.info",
+    "test": "forge test --fork-url \"https://arb1.arbitrum.io/rpc\" -vvv",
+    "slither": "slither . --checklist --show-ignored-findings > docs/slither-reports/All.md"
+  },
+  "devDependencies": {
+    "@lcov-viewer/cli": "^1.3.0"
+  }
+}

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-pragma solidity >=0.4.16 >=0.6.2 >=0.8.4 ^0.8.20;
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity >=0.4.16 >=0.6.2 >=0.8.4 ^0.8.20 ^0.8.25;
 
 // lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol
 
@@ -922,11 +922,7 @@ contract ManagedErc20 is ERC20Upgradeable {
      * @param newTokenSymbol The token symbol.
      * @param newDecimals The token decimals. Supported values are 6, 8 or 18.
      */
-    constructor(
-        string memory newTokenName, 
-        string memory newTokenSymbol,
-        uint8 newDecimals
-    ) initializer {
+    constructor(string memory newTokenName, string memory newTokenSymbol, uint8 newDecimals) initializer {
         if (newDecimals != 6 && newDecimals != 8 && newDecimals != 18) revert InvalidTokenDecimals();
 
         __ERC20_init_unchained(newTokenName, newTokenSymbol);
@@ -945,10 +941,7 @@ contract ManagedErc20 is ERC20Upgradeable {
      * @param newMinter The minter. This is the only account authorized to mint tokens. It is usually a smart contract that implements a bridge or a vault.
      * @param newBurner The burner. This is the only account authorized to burn tokens. It is usually a smart contract that implements a bridge or a vault.
      */
-    function configure(
-        address newMinter,
-        address newBurner
-    ) public {
+    function configure(address newMinter, address newBurner) public {
         if (_DECIMALS < 1) revert TokenNotInitialized();
         if (DEPLOYED_BY != _msgSender()) revert InvalidDeployer();
         if (newMinter == address(0) || newMinter == address(1) || newMinter == address(this)) revert InvalidMinter();

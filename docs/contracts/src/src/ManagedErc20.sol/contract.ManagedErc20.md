@@ -1,4 +1,6 @@
 # ManagedErc20
+[Git Source](https://github.com/claudioromero/armada/blob/544a1c47ac4213092ede412214187258200ee867/src/ManagedErc20.sol)
+
 **Inherits:**
 ERC20Upgradeable
 

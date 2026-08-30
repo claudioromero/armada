@@ -19,6 +19,9 @@ contract MockChainlinkPriceFeed {
     function setAnswer(int256 newAnswer) external {
         answer = newAnswer;
         round += 1;
+        // casting to 'uint80' is safe because the round counter only starts at 1 and is pushed
+        // one step per setAnswer call in tests; it can never approach the uint80 ceiling.
+        // forge-lint: disable-next-line(unsafe-typecast)
         answeredInRound = uint80(round);
         updatedAt = block.timestamp;
     }

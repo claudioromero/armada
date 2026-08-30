@@ -1621,6 +1621,17 @@
   },
   {
     "type": "error",
+    "name": "VaultNotSwept",
+    "inputs": [
+      {
+        "name": "token",
+        "type": "address",
+        "internalType": "address"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "VaultReceiptTokenNonTransferable",
     "inputs": []
   },

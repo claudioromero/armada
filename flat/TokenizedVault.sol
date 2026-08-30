@@ -4451,6 +4451,15 @@ contract TokenizedVault is
     /// @notice The denominator of the withdrawal fee, expressed in basis points (10_000 = 100%).
     uint256 public constant FEE_DENOMINATOR = 10_000;
 
+    /// @notice Notional shares added to the share supply for share-price calculations.
+    /// @dev The vault never mints these shares; they permanently floor the value of a single share
+    ///      low enough that a direct token donation cannot push the share price above the value of
+    ///      a small deposit (first-depositor inflation), and they guarantee an empty vault turns a
+    ///      non-zero deposit into a non-zero number of shares. The offset keeps the conversion
+    ///      curve exactly 1:1 in underlying terms, so `decimals()` is unchanged and share prices
+    ///      stay readable.
+    uint256 private constant VIRTUAL_SHARES = 10 ** 6;
+
     /// @notice Thrown when a token has a number of decimals other than 6, 8 or 18.
     /// @param decimals The unsupported number of decimals.
     error VaultUnsupportedDecimals(uint8 decimals);
@@ -4506,8 +4515,14 @@ contract TokenizedVault is
     /// @notice Thrown when the withdrawal fee consumes the entire withdrawn amount.
     error VaultFeeExceedsAssets();
 
-    /// @notice Thrown when the vault does not hold enough underlying assets to pay out.
+    /// @notice Thrown when the vault does not hold enough total assets to pay out.
     error VaultInsufficientUnderlying();
+
+    /// @notice Thrown when trying to disable a token the vault still holds a balance of.
+    /// @dev The vault prices and pays out redemptions pro-rata across every held asset, so a
+    ///      token must be fully paid out before it can be dropped from the enabled set.
+    /// @param token The address of the held token.
+    error VaultNotSwept(address token);
 
     /// @notice Thrown when attempting to withdraw before the withdrawal timelock has expired.
     /// @param unlockTime The timestamp at which the withdrawal becomes available.
@@ -4629,7 +4644,7 @@ contract TokenizedVault is
     /// @param withdrawalTimelock_ The withdrawal timelock in seconds.
     /// @param minimumDepositAmount_ The minimum deposit amount in underlying-decimal units.
     /// @param withdrawalFee_ The withdrawal fee in basis points.
-    /// @custom:reverts VaultZeroAddress If the underlying asset or price feed is the zero address.
+    /// @custom:reverts VaultZeroAddress If `initialOwner`, the underlying asset, or the price feed is the zero address.
     /// @custom:reverts VaultInvalidERC20 If the underlying asset is not a valid ERC-20.
     /// @custom:reverts VaultUnsupportedDecimals If the underlying asset does not have 6, 8 or 18 decimals.
     /// @custom:reverts VaultInvalidFee If `withdrawalFee_` exceeds the 100% denominator.
@@ -4643,6 +4658,7 @@ contract TokenizedVault is
         uint256 minimumDepositAmount_,
         uint256 withdrawalFee_
     ) external initializer {
+        _requireNonZeroAddress(initialOwner);
         __Ownable_init(initialOwner);
         __Ownable2Step_init();
         __ERC20_init(sharesName, sharesSymbol);
@@ -4728,59 +4744,85 @@ contract TokenizedVault is
     function totalAssets() public view virtual override returns (uint256) {
         uint256 total = IERC20(underlyingAsset).balanceOf(address(this));
         uint256 len = _enabledTokens.length;
-        for (uint256 i = 0; i < len; i++) {
-            address token = _enabledTokens[i];
-            if (token != underlyingAsset) {
-                total += _tokenToUnderlying(IERC20(token).balanceOf(address(this)), token);
+        if (len > 0) {
+            uint256 pu = _priceUsd(underlyingPriceFeed);
+            for (uint256 i = 0; i < len; i++) {
+                address token = _enabledTokens[i];
+                if (token != underlyingAsset) {
+                    total += _tokenToUnderlying(IERC20(token).balanceOf(address(this)), token, pu);
+                }
             }
         }
         return total;
     }
 
     /// @notice Returns the maximum amount of underlying assets that `owner` can withdraw.
-    /// @dev Returns zero if the withdrawal timelock of `owner` has not elapsed, otherwise the
-    ///      value of the owner's shares converted to underlying assets. Depends only on `owner`,
-    ///      never on the caller.
+    /// @dev Returns zero if the withdrawal timelock of `owner` has not elapsed or if the
+    ///      withdrawal fee would consume the entire balance. Otherwise the value of the owner's
+    ///      shares converted to underlying assets. Depends only on `owner`, never on the caller.
     /// @param owner The address of the share owner.
     /// @return The maximum amount of assets.
     function maxWithdraw(address owner) public view virtual override returns (uint256) {
         if (_withdrawalLocked(owner)) {
             return 0;
         }
-        return convertToAssets(balanceOf(owner));
+        uint256 gross = convertToAssets(balanceOf(owner));
+        if (_computeWithdrawalFee(gross) >= gross) {
+            return 0;
+        }
+        return gross;
     }
 
     /// @notice Returns the maximum amount of shares that `owner` can redeem.
-    /// @dev Returns zero if the withdrawal timelock has not elapsed, otherwise the owner's balance.
+    /// @dev Returns zero if the withdrawal timelock has not elapsed or if the withdrawal fee
+    ///      would consume the owner's entire balance, otherwise the owner's balance.
     /// @param owner The address of the share owner.
     /// @return The maximum amount of shares.
     function maxRedeem(address owner) public view virtual override returns (uint256) {
         if (_withdrawalLocked(owner)) {
             return 0;
         }
+        uint256 gross = convertToAssets(balanceOf(owner));
+        if (_computeWithdrawalFee(gross) >= gross) {
+            return 0;
+        }
         return balanceOf(owner);
     }
 
     /// @notice Returns the amount of shares that would be burned for a given withdrawal of assets.
-    /// @dev Returns zero if the withdrawal timelock of `msg.sender` has not elapsed.
-    /// @param assets The amount of assets in underlying-decimal units.
+    /// @dev Returns zero if the withdrawal timelock of `msg.sender` has not elapsed. Reverts if
+    ///      the withdrawal fee would consume the entire requested `assets` amount, mirroring
+    ///      `withdraw`.
+    /// @param assets The gross amount of assets requested in underlying-decimal units.
     /// @return The amount of shares.
+    /// @custom:reverts VaultFeeExceedsAssets If the withdrawal fee consumes the entire amount.
     function previewWithdraw(uint256 assets) public view virtual override returns (uint256) {
         if (_withdrawalLocked(msg.sender)) {
             return 0;
         }
+        if (_computeWithdrawalFee(assets) >= assets) {
+            revert VaultFeeExceedsAssets();
+        }
         return _convertToShares(assets, Math.Rounding.Ceil);
     }
 
-    /// @notice Returns the amount of assets that a given amount of shares would redeem.
-    /// @dev Returns zero if the withdrawal timelock of `msg.sender` has not elapsed.
+    /// @notice Returns the net amount of assets a given amount of shares would redeem.
+    /// @dev Returns zero if the withdrawal timelock of `msg.sender` has not elapsed. Returns the
+    ///      payout after deducting the withdrawal fee, mirroring `redeem`. Reverts if the fee
+    ///      would consume the shares' entire value.
     /// @param shares The amount of shares.
-    /// @return The amount of assets in underlying-decimal units.
+    /// @return The net assets in underlying-decimal units.
+    /// @custom:reverts VaultFeeExceedsAssets If the withdrawal fee consumes the entire value.
     function previewRedeem(uint256 shares) public view virtual override returns (uint256) {
         if (_withdrawalLocked(msg.sender)) {
             return 0;
         }
-        return _convertToAssets(shares, Math.Rounding.Floor);
+        uint256 gross = _convertToAssets(shares, Math.Rounding.Floor);
+        uint256 fee = _computeWithdrawalFee(gross);
+        if (fee >= gross) {
+            revert VaultFeeExceedsAssets();
+        }
+        return gross - fee;
     }
 
     /// @notice Deposits the underlying asset or an enabled token and mints receipt shares to `receiver`.
@@ -4800,11 +4842,7 @@ contract TokenizedVault is
     /// @custom:reverts VaultBelowMinimumDeposit If the deposit value is below the minimum deposit amount.
     /// @custom:reverts VaultInvalidPriceFeed If a price feed is invalid.
     /// @custom:reverts VaultStalePriceFeed If a price feed is stale.
-    function deposit(address token, uint256 amount, address receiver)
-        external
-        nonReentrant
-        returns (uint256 shares)
-    {
+    function deposit(address token, uint256 amount, address receiver) external nonReentrant returns (uint256 shares) {
         _requireNonZeroAddress(token);
         _requireNonZeroAddress(receiver);
         return _depositToken(token, amount, receiver);
@@ -4820,12 +4858,7 @@ contract TokenizedVault is
     /// @custom:reverts VaultZeroAmount If `assets` is zero.
     /// @custom:reverts VaultZeroShares If the deposit would mint zero shares.
     /// @custom:reverts VaultBelowMinimumDeposit If the deposit value is below the minimum deposit amount.
-    function deposit(uint256 assets, address receiver)
-        public
-        nonReentrant
-        override
-        returns (uint256 shares)
-    {
+    function deposit(uint256 assets, address receiver) public override nonReentrant returns (uint256 shares) {
         _requireNonZeroAddress(receiver);
         return _depositToken(underlyingAsset, assets, receiver);
     }
@@ -4849,7 +4882,7 @@ contract TokenizedVault is
         if (amount == 0) {
             revert VaultZeroAmount();
         }
-        uint256 assets = isUnderlying ? amount : _tokenToUnderlying(amount, token);
+        uint256 assets = isUnderlying ? amount : _tokenToUnderlying(amount, token, _priceUsd(underlyingPriceFeed));
         if (assets < minimumDepositAmount) {
             revert VaultBelowMinimumDeposit(minimumDepositAmount);
         }
@@ -4867,16 +4900,18 @@ contract TokenizedVault is
     }
 
     /// @notice Records deposit value and timestamp for a share owner.
-    /// @dev Starts the withdrawal timelock on a receiver's first deposit and restarts it on any
-    ///      deposit while the receiver is not currently locked. A deposit into an already-locked
-    ///      account (for example a donation to a third party) does not extend the running lock,
-    ///      preventing griefing of the timelock via repeated small deposits.
+    /// @dev Starts the withdrawal timelock on the receiver's first-ever funded deposit. A later
+    ///      deposit restarts the lock only when `msg.sender` is the receiver themself and the
+    ///      current lock has already expired, so the account's own growth is always protected by a
+    ///      fresh cooling period. Third-party donations never start, extend or restart the
+    ///      receiver's lock, preventing a griefer from indefinitely re-locking a victim's balance
+    ///      with dust deposits.
     /// @param receiver The address of the share owner.
     /// @param assets The value of the deposit in underlying-decimal units.
     function _recordDeposit(address receiver, uint256 assets) internal {
         uint256 currentAmount = deposits[receiver].amount;
         deposits[receiver].amount = currentAmount + assets;
-        if (currentAmount == 0 || !_withdrawalLocked(receiver)) {
+        if (currentAmount == 0 || (msg.sender == receiver && !_withdrawalLocked(receiver))) {
             deposits[receiver].timestamp = block.timestamp;
         }
     }
@@ -4890,7 +4925,7 @@ contract TokenizedVault is
     /// @custom:reverts VaultZeroAddress If `receiver` is the zero address.
     /// @custom:reverts VaultZeroShares If `shares` is zero.
     /// @custom:reverts VaultBelowMinimumDeposit If the deposit value is below the minimum deposit amount.
-    function mint(uint256 shares, address receiver) public nonReentrant override returns (uint256 assets) {
+    function mint(uint256 shares, address receiver) public override nonReentrant returns (uint256 assets) {
         _requireNonZeroAddress(receiver);
         _requireNotPaused();
         // Minting zero shares would only set the receiver's deposit timestamp, allowing griefing
@@ -4911,23 +4946,25 @@ contract TokenizedVault is
         emit Deposit(msg.sender, receiver, assets, shares);
     }
 
-    /// @notice Standard ERC-4626 redeem of `owner`'s shares for underlying assets.
-    /// @dev Burns `shares` from `owner` and pays out the underlying asset to `receiver`. The
-    ///      withdrawal timelock is checked against `owner`. If `msg.sender != owner`, an ERC-20
-    ///      allowance from `owner` is required and spent. Reentrancy protected.
+    /// @notice Standard ERC-4626 redeem of `owner`'s shares for a pro-rata slice of held assets.
+    /// @dev Burns `shares` from `owner` and pays out a pro-rata basket of the underlying and
+    ///      enabled-token holdings to `receiver`, so a vault that holds mostly enabled tokens
+    ///      stays liquid. The withdrawal timelock is checked against `owner`. If
+    ///      `msg.sender != owner`, an ERC-20 allowance from `owner` is required and spent.
+    ///      Reentrancy protected.
     /// @param shares The amount of shares to redeem.
-    /// @param receiver The address that receives the underlying assets.
+    /// @param receiver The address that receives the paid-out assets.
     /// @param owner The address whose shares are burned.
-    /// @return assets The amount of underlying assets paid out.
+    /// @return assets The value of the assets paid out, in underlying-decimal units.
     /// @custom:reverts VaultZeroAddress If `receiver` is the zero address.
     /// @custom:reverts VaultTimelockNotExpired If the withdrawal timelock has not elapsed.
-    /// @custom:reverts VaultInsufficientUnderlying If the vault does not hold enough underlying assets.
+    /// @custom:reverts VaultInsufficientUnderlying If the vault does not hold enough total assets.
     /// @custom:reverts VaultFeeExceedsAssets If the withdrawal fee consumes the entire withdrawn amount.
     /// @custom:reverts ERC20InsufficientAllowance If `msg.sender != owner` and lacks allowance.
     function redeem(uint256 shares, address receiver, address owner)
         public
-        nonReentrant
         override
+        nonReentrant
         returns (uint256 assets)
     {
         return _redeem(shares, receiver, owner);
@@ -4935,19 +4972,18 @@ contract TokenizedVault is
 
     /// @notice Shared redeem helper for the wrapper and standard ERC-4626 entry points.
     /// @dev Burns `shares` for their full underlying value; the withdrawal fee is deducted
-    ///      from the amount paid to `receiver` and forwarded to the `feeCollector`.
+    ///      from the basket paid to `receiver` and the retained remainder is forwarded to the
+    ///      `feeCollector` as the same pro-rata basket.
     /// @param shares The amount of shares to burn.
-    /// @param receiver The address that receives the underlying assets.
+    /// @param receiver The address that receives the paid-out assets.
     /// @param owner The address whose shares are burned.
-    /// @return amountOut The amount of underlying assets paid out after the withdrawal fee.
+    /// @return amountOut The value of the assets paid out after the withdrawal fee, in
+    ///      underlying-decimal units.
     function _redeem(uint256 shares, address receiver, address owner) internal returns (uint256 amountOut) {
         _requireNotPaused();
         _requireNonZeroAddress(receiver);
         _checkWithdrawalTimelock(owner);
         uint256 assets = _convertToAssets(shares, Math.Rounding.Floor);
-        if (IERC20(underlyingAsset).balanceOf(address(this)) < assets) {
-            revert VaultInsufficientUnderlying();
-        }
         uint256 fee = _computeWithdrawalFee(assets);
         if (fee >= assets) {
             revert VaultFeeExceedsAssets();
@@ -4956,8 +4992,7 @@ contract TokenizedVault is
         _spendAllowanceIfNotOwner(owner, shares);
 
         _burn(owner, shares);
-        IERC20(underlyingAsset).safeTransfer(receiver, amountOut);
-        _chargeWithdrawalFee(fee);
+        _payBasket(receiver, assets, amountOut);
 
         emit Withdraw(msg.sender, receiver, owner, amountOut, shares);
         return amountOut;
@@ -4965,39 +5000,38 @@ contract TokenizedVault is
 
     /// @notice Standard ERC-4626 withdraw of `assets` for `receiver`, burning `owner`'s shares.
     /// @dev Overrides `ERC4626Upgradeable` to enforce the reentrancy guard, the pause, the
-    ///      underlying balance check and the `owner`-scoped withdrawal timelock.
-    /// @param assets The amount of underlying assets to withdraw.
-    /// @param receiver The address that receives the underlying assets.
+    ///      total-assets liquidity check and the `owner`-scoped withdrawal timelock. Pays out
+    ///      a pro-rata basket of the vault's held assets.
+    /// @param assets The amount of value to withdraw, in underlying-decimal units.
+    /// @param receiver The address that receives the paid-out assets.
     /// @param owner The address whose shares are burned.
     /// @return shares The amount of shares burned.
     /// @custom:reverts VaultZeroAddress If `receiver` is the zero address.
     /// @custom:reverts VaultTimelockNotExpired If the withdrawal timelock has not elapsed.
-    /// @custom:reverts VaultInsufficientUnderlying If the vault does not hold enough underlying assets.
+    /// @custom:reverts VaultInsufficientUnderlying If the vault does not hold enough total assets.
     /// @custom:reverts VaultFeeExceedsAssets If the withdrawal fee consumes the entire withdrawn amount.
     /// @custom:reverts ERC20InsufficientAllowance If `msg.sender != owner` and lacks allowance.
     function withdraw(uint256 assets, address receiver, address owner)
         public
-        nonReentrant
         override
+        nonReentrant
         returns (uint256 shares)
     {
         return _withdrawAssets(assets, receiver, owner);
     }
 
     /// @notice Shared withdraw helper for the wrapper and standard ERC-4626 entry points.
-    /// @dev Burns `shares` for the full requested `assets` amount; the withdrawal fee is deducted
-    ///      from the amount paid to `receiver` and forwarded to the `feeCollector`.
-    /// @param assets The amount of underlying assets to withdraw.
-    /// @param receiver The address that receives the underlying assets.
+    /// @dev Burns `shares` for the full requested `assets` value; the withdrawal fee is deducted
+    ///      from the basket paid to `receiver` and the retained remainder is forwarded to the
+    ///      `feeCollector` as the same pro-rata basket.
+    /// @param assets The amount of value to withdraw, in underlying-decimal units.
+    /// @param receiver The address that receives the paid-out assets.
     /// @param owner The address whose shares are burned.
     /// @return shares The amount of shares burned.
     function _withdrawAssets(uint256 assets, address receiver, address owner) internal returns (uint256 shares) {
         _requireNotPaused();
         _requireNonZeroAddress(receiver);
         _checkWithdrawalTimelock(owner);
-        if (IERC20(underlyingAsset).balanceOf(address(this)) < assets) {
-            revert VaultInsufficientUnderlying();
-        }
         shares = _convertToShares(assets, Math.Rounding.Ceil);
         uint256 fee = _computeWithdrawalFee(assets);
         if (fee >= assets) {
@@ -5007,8 +5041,7 @@ contract TokenizedVault is
         _spendAllowanceIfNotOwner(owner, shares);
 
         _burn(owner, shares);
-        IERC20(underlyingAsset).safeTransfer(receiver, amountOut);
-        _chargeWithdrawalFee(fee);
+        _payBasket(receiver, assets, amountOut);
 
         emit Withdraw(msg.sender, receiver, owner, amountOut, shares);
     }
@@ -5051,20 +5084,108 @@ contract TokenizedVault is
         return amount.mulDiv(withdrawalFee, FEE_DENOMINATOR, Math.Rounding.Ceil);
     }
 
-    /// @notice Transfers a non-zero withdrawal fee to the fee collector.
-    /// @param fee The fee in underlying-decimal units to charge.
-    function _chargeWithdrawalFee(uint256 fee) internal {
-        if (fee > 0) {
-            IERC20(underlyingAsset).safeTransfer(feeCollector, fee);
+    /// @notice Converts underlying assets to `shares` using the virtual-share offset.
+    /// @dev Overrides `ERC4626Upgradeable` to add `VIRTUAL_SHARES` to the share supply so an
+    ///      empty vault still prices shares defensively against first-depositor inflation.
+    /// @param assets The amount of underlying assets to convert.
+    /// @param rounding The rounding direction.
+    /// @return shares The number of shares equivalent to `assets`.
+    function _convertToShares(uint256 assets, Math.Rounding rounding)
+        internal
+        view
+        virtual
+        override
+        returns (uint256 shares)
+    {
+        return assets.mulDiv(totalSupply() + VIRTUAL_SHARES, totalAssets() + 1, rounding);
+    }
+
+    /// @notice Converts `shares` to underlying assets using the virtual-share offset.
+    /// @dev Overrides `ERC4626Upgradeable` to mirror `_convertToShares`.
+    /// @param shares The number of shares to convert.
+    /// @param rounding The rounding direction.
+    /// @return assets The amount of underlying assets equivalent to `shares`.
+    function _convertToAssets(uint256 shares, Math.Rounding rounding)
+        internal
+        view
+        virtual
+        override
+        returns (uint256 assets)
+    {
+        return shares.mulDiv(totalAssets() + 1, totalSupply() + VIRTUAL_SHARES, rounding);
+    }
+
+    /// @notice Pays out a pro-rata basket of the vault's held assets for a withdrawal.
+    /// @dev Each held asset (the underlying plus every enabled token) contributes its share of
+    ///      `gross` proportionally to its share of `totalAssets()`. The receiver gets `amountOut`
+    ///      worth of that basket, floored in the vault's favor; the remainder (the withdrawal
+    ///      fee) is forwarded to the fee collector as the same basket. Reverts when the vault
+    ///      values less than `gross`, which can only happen if the requested value exceeds the
+    ///      total assets.
+    /// @param receiver The address that receives the paid-out assets.
+    /// @param gross The gross value being withdrawn, in underlying-decimal units.
+    /// @param amountOut The post-fee value paid to `receiver`, in underlying-decimal units.
+    /// @custom:reverts VaultInsufficientUnderlying If the vault's total assets are below `gross`.
+    function _payBasket(address receiver, uint256 gross, uint256 amountOut) internal {
+        uint256 total = totalAssets();
+        if (gross > total) {
+            revert VaultInsufficientUnderlying();
+        }
+        if (total == 0) {
+            return;
+        }
+
+        uint256 underlyingUnitsForGross =
+            IERC20(underlyingAsset).balanceOf(address(this)).mulDiv(gross, total, Math.Rounding.Floor);
+        if (underlyingUnitsForGross > 0) {
+            uint256 underlyingOut = underlyingUnitsForGross.mulDiv(amountOut, gross, Math.Rounding.Floor);
+            if (underlyingOut > 0) {
+                IERC20(underlyingAsset).safeTransfer(receiver, underlyingOut);
+            }
+            _tryCollectFee(underlyingAsset, underlyingUnitsForGross - underlyingOut);
+        }
+
+        uint256 len = _enabledTokens.length;
+        for (uint256 i = 0; i < len; i++) {
+            address token = _enabledTokens[i];
+            if (token == underlyingAsset) {
+                continue;
+            }
+            uint256 tokenUnitsForGross =
+                IERC20(token).balanceOf(address(this)).mulDiv(gross, total, Math.Rounding.Floor);
+            if (tokenUnitsForGross == 0) {
+                continue;
+            }
+            uint256 tokenOut = tokenUnitsForGross.mulDiv(amountOut, gross, Math.Rounding.Floor);
+            if (tokenOut > 0) {
+                IERC20(token).safeTransfer(receiver, tokenOut);
+            }
+            _tryCollectFee(token, tokenUnitsForGross - tokenOut);
+        }
+    }
+
+    /// @notice Forwards a non-zero fee share to the fee collector.
+    /// @dev The fee remainder is kept in the vault if the collector cannot currently receive the
+    ///      asset (for example it is blacklisted by a blocklisting token or rejects transfers);
+    ///      the withdrawal still succeeds. A retained remainder stays part of `totalAssets` and
+    ///      accrues to shareholders; collection resumes once a collector that can receive the
+    ///      asset is set.
+    /// @param token The asset whose fee remainder is being collected.
+    /// @param amount The fee remainder in the asset's native decimals.
+    function _tryCollectFee(address token, uint256 amount) internal {
+        if (amount > 0) {
+            try IERC20(token).transfer(feeCollector, amount) {} catch {}
         }
     }
 
     /// @notice Converts an amount of an enabled token to its value in the underlying asset.
+    /// @dev Takes the pre-computed underlying price to avoid re-reading the feed per token.
     /// @param amount The amount of the token in its native decimals.
     /// @param token The address of the enabled token.
+    /// @param pu The underlying asset's 18-decimal USD price.
     /// @return The value of the amount in underlying-decimal units.
-    function _tokenToUnderlying(uint256 amount, address token) internal view returns (uint256) {
-        uint256 tokenValue = getTokenValue(token);
+    function _tokenToUnderlying(uint256 amount, address token, uint256 pu) internal view returns (uint256) {
+        uint256 tokenValue = _tokenValueInUnderlying(token, pu);
         uint256 tDecimals = tokenPriceFeeds[token].decimals;
         return amount * tokenValue * (10 ** underlyingDecimals) / (10 ** tDecimals) / 1e18;
     }
@@ -5082,7 +5203,21 @@ contract TokenizedVault is
         if (!isTokenEnabled[token]) {
             revert VaultNotEnabled(token);
         }
-        uint256 pu = _priceUsd(underlyingPriceFeed);
+        return _tokenValueInUnderlying(token, _priceUsd(underlyingPriceFeed));
+    }
+
+    /// @notice Returns the value of one unit of an enabled token in terms of the underlying asset,
+    ///      using a pre-computed underlying price.
+    /// @dev Computed as the ratio of the token's USD price to the underlying asset's USD price,
+    ///      scaled to 18 decimals.
+    /// @param token The address of the enabled token.
+    /// @param pu The underlying asset's 18-decimal USD price.
+    /// @return The token value in 18-decimal units.
+    /// @custom:reverts VaultNotEnabled If the token is not enabled.
+    /// @custom:reverts VaultInvalidPriceFeed If the token's price feed is invalid.
+    /// @custom:reverts VaultInvalidPriceFeedRound If the feed's answer was not from its latest round.
+    /// @custom:reverts VaultStalePriceFeed If the feed's data is stale.
+    function _tokenValueInUnderlying(address token, uint256 pu) internal view returns (uint256) {
         uint256 px = _priceUsd(tokenPriceFeeds[token].feed);
         return px * (10 ** 18) / pu;
     }
@@ -5149,12 +5284,15 @@ contract TokenizedVault is
     }
 
     /// @notice Disables a token, removing it from the enabled set.
-    /// @dev Only the owner may call. Does not prevent the vault from continuing to hold the token.
-    ///      The underlying asset cannot be disabled since it is never an enabled token.
+    /// @dev Only the owner may call. The vault is disallowed from disabling a token it still
+    ///      holds a balance of, because redemptions pay out pro-rata across every held asset;
+    ///      the owner must first allow the balance to be paid out to withdrawers. The underlying
+    ///      asset cannot be disabled since it is never an enabled token.
     /// @param tokenAddr The address of the token to disable.
     /// @custom:reverts VaultZeroAddress If `tokenAddr` is the zero address.
     /// @custom:reverts VaultCannotDisableUnderlying If `tokenAddr` is the underlying asset.
     /// @custom:reverts VaultNotEnabled If the token is not enabled.
+    /// @custom:reverts VaultNotSwept If the vault still holds a balance of the token.
     function disableToken(address tokenAddr) external nonReentrant onlyOwner {
         _requireNonZeroAddress(tokenAddr);
         if (tokenAddr == underlyingAsset) {
@@ -5162,6 +5300,9 @@ contract TokenizedVault is
         }
         if (!isTokenEnabled[tokenAddr]) {
             revert VaultNotEnabled(tokenAddr);
+        }
+        if (IERC20(tokenAddr).balanceOf(address(this)) > 0) {
+            revert VaultNotSwept(tokenAddr);
         }
         isTokenEnabled[tokenAddr] = false;
         delete tokenPriceFeeds[tokenAddr];

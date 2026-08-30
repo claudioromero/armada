@@ -40,6 +40,10 @@ contract VaultTest is Test {
 
     bytes32 internal constant SALT = keccak256("armada-vault-v1");
 
+    /// @notice Mirrors `TokenizedVault`'s notional virtual-share offset, which keeps the share
+    ///         price defensive against first-depositor inflation while staying 1:1 in value.
+    uint256 internal constant VIRTUAL_SHARES = 10 ** 6;
+
     function setUp() public virtual {
         usdc = new MockERC20("USD Coin", "USDC", 6);
         usdt = new MockERC20("Tether USD", "USDT", 6);
@@ -84,6 +88,18 @@ contract VaultTest is Test {
             (address(this), address(underlying), "Armada Vault Shares", "AVS", address(underlyingFeed), timelock, 0, 0)
         );
         address proxy = factory.deployProxy(SALT, initData);
+        v = TokenizedVault(payable(proxy));
+    }
+
+    function _deployVaultSalt(bytes32 salt, MockERC20 underlying, MockChainlinkPriceFeed underlyingFeed)
+        internal
+        returns (TokenizedVault v)
+    {
+        bytes memory initData = abi.encodeCall(
+            TokenizedVault.initialize,
+            (address(this), address(underlying), "Armada Vault Shares", "AVS", address(underlyingFeed), 0, 0, 0)
+        );
+        address proxy = factory.deployProxy(salt, initData);
         v = TokenizedVault(payable(proxy));
     }
 
@@ -182,12 +198,24 @@ contract VaultInitTest is VaultTest {
         f.deployProxy(SALT, initData);
     }
 
+    function test_initialize_revertsForZeroInitialOwner() public {
+        TokenizedVault impl = new TokenizedVault();
+        VaultProxyAdmin admin = _deployProxyAdmin();
+        ProxyFactory f = _deployProxyFactory(address(impl), address(admin));
+        bytes memory initData = abi.encodeCall(
+            TokenizedVault.initialize, (address(0), address(usdc), "AV", "AV", address(feedUsdc), 0, 0, 0)
+        );
+        vm.expectRevert(abi.encodeWithSelector(TokenizedVault.VaultZeroAddress.selector, address(0)));
+        f.deployProxy(SALT, initData);
+    }
+
     function test_initialize_revertsForZeroUnderlying() public {
         TokenizedVault impl = new TokenizedVault();
         VaultProxyAdmin admin = _deployProxyAdmin();
         ProxyFactory f = _deployProxyFactory(address(impl), address(admin));
-        bytes memory initData =
-            abi.encodeCall(TokenizedVault.initialize, (address(this), address(0), "AV", "AV", address(feedUsdc), 0, 0, 0));
+        bytes memory initData = abi.encodeCall(
+            TokenizedVault.initialize, (address(this), address(0), "AV", "AV", address(feedUsdc), 0, 0, 0)
+        );
         vm.expectRevert(abi.encodeWithSelector(TokenizedVault.VaultZeroAddress.selector, address(0)));
         f.deployProxy(SALT, initData);
     }
@@ -313,6 +341,28 @@ contract VaultEnableDisableTest is VaultTest {
         vault.disableToken(address(dai));
     }
 
+    function test_disableToken_revertsWhileVaultHoldsBalance() public {
+        _enable(address(dai), feedDai, 18);
+        _mintAndApprove(dai, alice, 100e18);
+        vm.prank(alice);
+        vault.deposit(address(dai), 100e18, alice);
+        vm.expectRevert(abi.encodeWithSelector(TokenizedVault.VaultNotSwept.selector, address(dai)));
+        vault.disableToken(address(dai));
+        assertTrue(vault.isTokenEnabled(address(dai)), "token stays enabled");
+    }
+
+    function test_disableToken_succeedsAfterBalancePaidOut() public {
+        _enable(address(dai), feedDai, 18);
+        _mintAndApprove(dai, alice, 100e18);
+        vm.prank(alice);
+        uint256 shares = vault.deposit(address(dai), 100e18, alice);
+        vm.prank(alice);
+        vault.redeem(shares, alice, alice);
+        assertEq(dai.balanceOf(address(vault)), 0, "balance fully paid out");
+        vault.disableToken(address(dai));
+        assertFalse(vault.isTokenEnabled(address(dai)));
+    }
+
     function test_getTokenValue_revertsWhenNotEnabled() public {
         vm.expectRevert(abi.encodeWithSelector(TokenizedVault.VaultNotEnabled.selector, address(dai)));
         vault.getTokenValue(address(dai));
@@ -397,28 +447,31 @@ contract VaultErc4626Test is VaultTest {
 
     function test_math_emptyVault() public view {
         assertEq(vault.totalAssets(), 0);
-        assertEq(vault.convertToShares(100e6), 100e6);
-        assertEq(vault.convertToAssets(100e6), 100e6);
-        assertEq(vault.previewDeposit(100e6), 100e6);
-        assertEq(vault.previewMint(100e6), 100e6);
-        assertEq(vault.previewWithdraw(100e6), 100e6);
-        assertEq(vault.previewRedeem(100e6), 100e6);
+        // The virtual-share offset prices 1 underlying unit as 10**6 shares even in an empty
+        // vault, so conversion stays 1:1 in value rather than 1:1 in raw units.
+        assertEq(vault.convertToShares(100e6), 100e6 * VIRTUAL_SHARES);
+        assertEq(vault.convertToAssets(100e6), 100e6 / VIRTUAL_SHARES);
+        assertEq(vault.previewDeposit(100e6), 100e6 * VIRTUAL_SHARES);
+        assertEq(vault.previewMint(100e6), 100e6 / VIRTUAL_SHARES);
+        assertEq(vault.previewWithdraw(100e6), 100e6 * VIRTUAL_SHARES);
+        assertEq(vault.previewRedeem(100e6), 100e6 / VIRTUAL_SHARES);
         assertEq(vault.maxDeposit(alice), type(uint256).max);
         assertEq(vault.maxMint(alice), type(uint256).max);
         assertEq(vault.maxRedeem(alice), 0);
         assertEq(vault.maxWithdraw(alice), 0);
     }
 
-    function test_deposit_singleDepositMintsOneToOne() public {
+    function test_deposit_singleDepositMintsSharesAtOneToOneValue() public {
         uint256 assets = _toUnderlying(100e18, feedDai, 18, _usdPrice(feedUsdc), 6);
+        uint256 shares = assets * VIRTUAL_SHARES;
         vm.prank(alice);
         vm.expectEmit(true, true, true, true);
-        emit IERC4626.Deposit(alice, alice, assets, assets);
-        uint256 shares = vault.deposit(address(dai), 100e18, alice);
+        emit IERC4626.Deposit(alice, alice, assets, shares);
+        uint256 minted = vault.deposit(address(dai), 100e18, alice);
 
-        assertEq(shares, assets);
-        assertEq(vault.balanceOf(alice), shares);
-        assertEq(vault.totalSupply(), shares);
+        assertEq(minted, shares);
+        assertEq(vault.balanceOf(alice), minted);
+        assertEq(vault.totalSupply(), minted);
         assertEq(vault.totalAssets(), assets);
         assertEq(dai.balanceOf(address(vault)), 100e18);
         assertEq(usdc.balanceOf(address(vault)), 0);
@@ -436,11 +489,28 @@ contract VaultErc4626Test is VaultTest {
         vm.prank(bob);
         uint256 bShares = vault.deposit(address(usdc), 50e6, bob);
 
-        assertEq(aShares, aAssets);
-        assertEq(bShares, 50e6);
+        assertEq(aShares, aAssets * VIRTUAL_SHARES);
+        assertEq(bShares, 50e6 * VIRTUAL_SHARES);
         assertEq(aShares + bShares, vault.totalSupply());
         assertEq(vault.convertToAssets(vault.balanceOf(alice)), aAssets);
         assertEq(vault.convertToAssets(vault.balanceOf(bob)), 50e6);
+    }
+
+    function test_deposit_startingDonationCannotRoundVictimToZeroShares() public {
+        // The attacker front-runs the first deposit with a dust stake and then inflates the
+        // vault with a large direct donation. The virtual-share offset must guarantee the
+        // victim's deposit mints real shares worth their full principal.
+        _mintAndApprove(usdc, bob, 5_000e6);
+        vm.prank(bob);
+        uint256 attackerShares = vault.deposit(address(usdc), 1, bob);
+        assertEq(attackerShares, VIRTUAL_SHARES, "first deposit mints a full virtual-share stake");
+        usdc.mint(address(vault), 5_000e6); // donation, bypassing deposit
+
+        _mintAndApprove(usdc, carol, 1_000e6);
+        vm.prank(carol);
+        uint256 carolShares = vault.deposit(address(usdc), 1_000e6, carol);
+        assertGt(carolShares, 0, "victim deposit must not round to zero shares");
+        assertApproxEqAbs(vault.convertToAssets(carolShares), 1_000e6, 1_000_000, "victim retains full principal");
     }
 
     function test_deposit_revertsWhenTokenNotEnabled() public {
@@ -507,8 +577,7 @@ contract VaultDepositPairingsTest is VaultTest {
         MockERC20 enabled,
         MockChainlinkPriceFeed enabledFeed,
         uint8 tDecimals,
-        uint256 depositAmount,
-        uint256 expectedSharesOffset
+        uint256 depositAmount
     ) internal {
         vault = _deployVault(underlying, underlyingFeed, 0);
         _enable(address(enabled), enabledFeed, tDecimals);
@@ -518,46 +587,47 @@ contract VaultDepositPairingsTest is VaultTest {
         uint256 assets = _toUnderlying(depositAmount, enabledFeed, tDecimals, pu, uDecimals);
         vm.prank(alice);
         uint256 shares = vault.deposit(address(enabled), depositAmount, alice);
-        assertEq(shares, assets + expectedSharesOffset, "shares");
+        assertEq(shares, vault.previewDeposit(assets), "shares");
+        assertEq(shares, assets * VIRTUAL_SHARES, "first deposit holds 1:1 value");
         assertEq(vault.balanceOf(alice), shares);
         assertTrue(assets > 0);
         assertEq(vault.getTokenValue(address(enabled)) > 0, true);
     }
 
     function test_usdcUnderlyingDaiEnabled() public {
-        _depositAndCheck(usdc, feedUsdc, 6, dai, feedDai, 18, 100e18, 0);
+        _depositAndCheck(usdc, feedUsdc, 6, dai, feedDai, 18, 100e18);
     }
 
     function test_usdcUnderlyingUsdtEnabled() public {
-        _depositAndCheck(usdc, feedUsdc, 6, usdt, feedUsdt, 6, 100e6, 0);
+        _depositAndCheck(usdc, feedUsdc, 6, usdt, feedUsdt, 6, 100e6);
     }
 
     function test_usdcUnderlyingWbtcEnabled() public {
-        _depositAndCheck(usdc, feedUsdc, 6, wbtc, feedWbtc, 8, 1e8, 0);
+        _depositAndCheck(usdc, feedUsdc, 6, wbtc, feedWbtc, 8, 1e8);
     }
 
     function test_usdcUnderlyingWethEnabled() public {
-        _depositAndCheck(usdc, feedUsdc, 6, weth, feedWeth, 18, 1e18, 0);
+        _depositAndCheck(usdc, feedUsdc, 6, weth, feedWeth, 18, 1e18);
     }
 
     function test_wbtcUnderlyingUsdcEnabled() public {
-        _depositAndCheck(wbtc, feedWbtc, 8, usdc, feedUsdc, 6, 100e6, 0);
+        _depositAndCheck(wbtc, feedWbtc, 8, usdc, feedUsdc, 6, 100e6);
     }
 
     function test_wbtcUnderlyingWethEnabled() public {
-        _depositAndCheck(wbtc, feedWbtc, 8, weth, feedWeth, 18, 1e18, 0);
+        _depositAndCheck(wbtc, feedWbtc, 8, weth, feedWeth, 18, 1e18);
     }
 
     function test_wethUnderlyingWbtcEnabled() public {
-        _depositAndCheck(weth, feedWeth, 18, wbtc, feedWbtc, 8, 1e8, 0);
+        _depositAndCheck(weth, feedWeth, 18, wbtc, feedWbtc, 8, 1e8);
     }
 
     function test_wethUnderlyingUsdcEnabled() public {
-        _depositAndCheck(weth, feedWeth, 18, usdc, feedUsdc, 6, 100e6, 0);
+        _depositAndCheck(weth, feedWeth, 18, usdc, feedUsdc, 6, 100e6);
     }
 
     function test_wethUnderlyingUsdtEnabled() public {
-        _depositAndCheck(weth, feedWeth, 18, usdt, feedUsdt, 6, 100e6, 0);
+        _depositAndCheck(weth, feedWeth, 18, usdt, feedUsdt, 6, 100e6);
     }
 
     function test_getTokenValueMatchesPriceRatio() public {
@@ -610,7 +680,7 @@ contract VaultWithdrawalTest is VaultTest {
         shares = vault.deposit(address(dai), daiAmount, alice);
     }
 
-    function test_redeem_paysInUnderlyingOnly() public {
+    function test_redeem_paysProportionalBasket() public {
         uint256 assets = _toUnderlying(100e18, feedDai, 18, _usdPrice(feedUsdc), 6);
         uint256 shares = _depositAlice(100e18);
         uint256 vaultDaiBefore = dai.balanceOf(address(vault));
@@ -621,23 +691,25 @@ contract VaultWithdrawalTest is VaultTest {
         emit IERC4626.Withdraw(alice, alice, alice, assets, shares);
         uint256 received = vault.redeem(shares, alice, alice);
 
-        assertEq(received, assets);
-        assertEq(usdc.balanceOf(alice), assets, "paid in underlying");
+        assertEq(received, assets, "returned value is in underlying units");
+        assertTrue(usdc.balanceOf(alice) > 0, "paid a pro-rata slice of the underlying");
+        assertTrue(dai.balanceOf(alice) > 0, "paid a pro-rata slice of the enabled token");
         assertEq(vault.balanceOf(alice), 0);
-        assertEq(dai.balanceOf(address(vault)), vaultDaiBefore, "enabled token holdings unchanged");
-        assertEq(usdc.balanceOf(address(vault)), vaultUsdcBefore - assets, "underlying paid out");
+        assertLt(dai.balanceOf(address(vault)), vaultDaiBefore, "enabled token holdings reduced");
+        assertLt(usdc.balanceOf(address(vault)), vaultUsdcBefore, "underlying holdings reduced");
     }
 
-    function test_withdraw_paysInUnderlyingOnly() public {
+    function test_withdraw_paysProportionalBasket() public {
         uint256 assets = _toUnderlying(100e18, feedDai, 18, _usdPrice(feedUsdc), 6);
         _depositAlice(100e18);
 
         vm.prank(alice);
         uint256 shares = vault.withdraw(assets, alice, alice);
 
-        assertEq(shares, assets);
-        assertEq(usdc.balanceOf(alice), assets);
-        assertEq(dai.balanceOf(address(vault)), 100e18, "enabled token holdings unchanged");
+        assertEq(shares, vault.previewWithdraw(assets));
+        assertTrue(usdc.balanceOf(alice) > 0, "paid a pro-rata slice of the underlying");
+        assertTrue(dai.balanceOf(alice) > 0, "paid a pro-rata slice of the enabled token");
+        assertLt(dai.balanceOf(address(vault)), 100e18, "enabled token holdings reduced");
         assertEq(vault.balanceOf(alice), 0);
     }
 
@@ -650,31 +722,51 @@ contract VaultWithdrawalTest is VaultTest {
         assertTrue(usdc.balanceOf(alice) > 0);
     }
 
-    function test_redeem_revertsWhenInsufficientUnderlying() public {
-        _depositAlice(100e18);
-        // carol drains all of her underlying reserves from the vault
-        uint256 carolMax = vault.maxWithdraw(carol);
-        vm.prank(carol);
-        vault.withdraw(carolMax, carol, carol);
-        assertEq(usdc.balanceOf(address(vault)), 0);
-        // the vault now holds only the enabled token (DAI) but must pay in underlying
-        uint256 aliceShares = vault.balanceOf(alice);
+    function test_redeem_paysEnabledTokenWhenNoUnderlying() public {
+        // a vault holding only the enabled token stays fully liquid
+        TokenizedVault daiOnly = _deployVaultSalt(keccak256("no-underlying-v1"), usdc, feedUsdc);
+        daiOnly.enableToken(address(dai), address(feedDai), 18);
+        dai.mint(alice, 100e18);
         vm.prank(alice);
-        vm.expectRevert(TokenizedVault.VaultInsufficientUnderlying.selector);
-        vault.redeem(aliceShares, alice, alice);
+        dai.approve(address(daiOnly), 100e18);
+        vm.prank(alice);
+        uint256 dshares = daiOnly.deposit(address(dai), 100e18, alice);
+        assertEq(usdc.balanceOf(address(daiOnly)), 0, "no underlying backing");
+        uint256 aliceDaiBefore = dai.balanceOf(alice);
+        vm.prank(alice);
+        uint256 received = daiOnly.redeem(dshares, alice, alice);
+        assertEq(received, 100e6);
+        assertEq(dai.balanceOf(alice), aliceDaiBefore + 100e18, "paid out of the enabled-token holdings");
+        assertEq(dai.balanceOf(address(daiOnly)), 0, "vault fully unwound in the enabled token");
     }
 
-    function test_withdraw_revertsWhenInsufficientUnderlying() public {
-        _depositAlice(100e18);
-        // carol drains all of her underlying reserves from the vault
-        uint256 carolMax = vault.maxWithdraw(carol);
-        vm.prank(carol);
-        vault.withdraw(carolMax, carol, carol);
-        assertEq(usdc.balanceOf(address(vault)), 0);
-        // the vault now holds only the enabled token (DAI) but must pay in underlying
+    function test_withdraw_paysEnabledTokenWhenNoUnderlying() public {
+        // a vault holding only the enabled token stays fully liquid
+        TokenizedVault daiOnly = _deployVaultSalt(keccak256("no-underlying-v2"), usdc, feedUsdc);
+        daiOnly.enableToken(address(dai), address(feedDai), 18);
+        dai.mint(alice, 100e18);
         vm.prank(alice);
-        vm.expectRevert(TokenizedVault.VaultInsufficientUnderlying.selector);
-        vault.withdraw(10e6, alice, alice);
+        dai.approve(address(daiOnly), 100e18);
+        vm.prank(alice);
+        daiOnly.deposit(address(dai), 100e18, alice);
+        assertEq(usdc.balanceOf(address(daiOnly)), 0, "no underlying backing");
+        vm.prank(alice);
+        uint256 shares = daiOnly.withdraw(10e6, alice, alice);
+        assertEq(shares, daiOnly.previewWithdraw(10e6));
+        assertTrue(dai.balanceOf(alice) > 0, "paid from the enabled-token holdings");
+        assertLt(dai.balanceOf(address(daiOnly)), 100e18, "enabled-token holdings reduced");
+    }
+
+    function test_redeem_feeChargedAsProRataBasket() public {
+        vault.setFeeCollector(bob);
+        vault.setWithdrawalFee(500); // 5%
+        uint256 shares = _depositAlice(100e18);
+        vm.prank(alice);
+        vault.redeem(shares, alice, alice);
+        assertTrue(usdc.balanceOf(alice) > 0 && dai.balanceOf(alice) > 0, "receiver paid both assets");
+        assertTrue(usdc.balanceOf(bob) > 0, "collector receives the underlying fee share");
+        assertTrue(dai.balanceOf(bob) > 0, "collector receives the enabled-token fee share");
+        assertEq(vault.balanceOf(alice), 0);
     }
 
     function test_redeem_revertsWhenNoShares() public {
@@ -891,7 +983,7 @@ contract VaultReceiptTokenTest is VaultTest {
 
     function test_sharesAreMintedAndBurned() public {
         uint256 shares = vault.balanceOf(alice);
-        assertEq(shares, 100e6);
+        assertEq(shares, 100e6 * VIRTUAL_SHARES);
         vm.prank(alice);
         vault.redeem(shares, alice, alice);
         assertEq(vault.balanceOf(alice), 0);
@@ -967,8 +1059,9 @@ contract VaultAdminUpgradeTest is VaultTest {
 
 contract ProxyFactoryTest is VaultTest {
     function test_deployProxy_emitsEventAndPredictsAddress() public {
-        bytes memory initData =
-            abi.encodeCall(TokenizedVault.initialize, (address(this), address(usdc), "AV", "AV", address(feedUsdc), 0, 0, 0));
+        bytes memory initData = abi.encodeCall(
+            TokenizedVault.initialize, (address(this), address(usdc), "AV", "AV", address(feedUsdc), 0, 0, 0)
+        );
         address predicted = factory.predictProxyAddress(SALT, initData);
         vm.expectEmit(true, true, true, true);
         emit ProxyFactory.ProxyDeployed(predicted, address(implementation), address(proxyAdmin));
@@ -978,24 +1071,27 @@ contract ProxyFactoryTest is VaultTest {
     }
 
     function test_deployProxy_uniqueSalt() public {
-        bytes memory initData =
-            abi.encodeCall(TokenizedVault.initialize, (address(this), address(usdc), "AV", "AV", address(feedUsdc), 0, 0, 0));
+        bytes memory initData = abi.encodeCall(
+            TokenizedVault.initialize, (address(this), address(usdc), "AV", "AV", address(feedUsdc), 0, 0, 0)
+        );
         address proxy1 = factory.deployProxy(SALT, initData);
         address proxy2 = factory.deployProxy(keccak256("other"), initData);
         assertTrue(proxy1 != proxy2);
     }
 
     function test_deployProxy_sameSaltReverts() public {
-        bytes memory initData =
-            abi.encodeCall(TokenizedVault.initialize, (address(this), address(usdc), "AV", "AV", address(feedUsdc), 0, 0, 0));
+        bytes memory initData = abi.encodeCall(
+            TokenizedVault.initialize, (address(this), address(usdc), "AV", "AV", address(feedUsdc), 0, 0, 0)
+        );
         factory.deployProxy(SALT, initData);
         vm.expectRevert();
         factory.deployProxy(SALT, initData);
     }
 
     function test_predictProxyAddress_defined() public view {
-        bytes memory initData =
-            abi.encodeCall(TokenizedVault.initialize, (address(this), address(usdc), "AV", "AV", address(feedUsdc), 0, 0, 0));
+        bytes memory initData = abi.encodeCall(
+            TokenizedVault.initialize, (address(this), address(usdc), "AV", "AV", address(feedUsdc), 0, 0, 0)
+        );
         assertTrue(factory.predictProxyAddress(SALT, initData) != address(0));
     }
 
@@ -1048,16 +1144,18 @@ contract ProxyFactoryTest is VaultTest {
     }
 
     function test_deployProxy_onlyOwner() public {
-        bytes memory initData =
-            abi.encodeCall(TokenizedVault.initialize, (address(this), address(usdc), "AV", "AV", address(feedUsdc), 0, 0, 0));
+        bytes memory initData = abi.encodeCall(
+            TokenizedVault.initialize, (address(this), address(usdc), "AV", "AV", address(feedUsdc), 0, 0, 0)
+        );
         vm.prank(alice);
         vm.expectRevert();
         factory.deployProxy(SALT, initData);
     }
 
     function test_adminCanCallUpgradeToAndCallDirectly() public {
-        bytes memory initData =
-            abi.encodeCall(TokenizedVault.initialize, (address(this), address(usdc), "AV", "AV", address(feedUsdc), 0, 0, 0));
+        bytes memory initData = abi.encodeCall(
+            TokenizedVault.initialize, (address(this), address(usdc), "AV", "AV", address(feedUsdc), 0, 0, 0)
+        );
         TokenizedVault impl2 = new TokenizedVault();
         address proxy = factory.deployProxy(SALT, initData);
         vm.prank(address(proxyAdmin));
@@ -1068,8 +1166,9 @@ contract ProxyFactoryTest is VaultTest {
 
 contract VaultProxyDirectTest is VaultTest {
     function test_constructor_rejectsZeroAdmin() public {
-        bytes memory initData =
-            abi.encodeCall(TokenizedVault.initialize, (address(this), address(usdc), "AV", "AV", address(feedUsdc), 0, 0, 0));
+        bytes memory initData = abi.encodeCall(
+            TokenizedVault.initialize, (address(this), address(usdc), "AV", "AV", address(feedUsdc), 0, 0, 0)
+        );
         vm.expectRevert(abi.encodeWithSelector(VaultTransparentProxy.ProxyInvalidAdmin.selector, address(0)));
         new VaultTransparentProxy(address(implementation), address(0), initData);
     }
@@ -1116,9 +1215,9 @@ contract VaultErc4626StandardTest is VaultTest {
         _mintAndApprove(usdc, alice, 100e6);
         vm.prank(alice);
         uint256 shares = vault.deposit(100e6, bob);
-        assertEq(shares, 100e6);
+        assertEq(shares, 100e6 * VIRTUAL_SHARES);
         assertEq(vault.balanceOf(alice), 0);
-        assertEq(vault.balanceOf(bob), 100e6);
+        assertEq(vault.balanceOf(bob), shares);
         assertEq(usdc.balanceOf(address(vault)), 100e6);
         (uint256 amount, uint256 timestamp) = vault.deposits(bob);
         assertEq(amount, 100e6);
@@ -1137,9 +1236,9 @@ contract VaultErc4626StandardTest is VaultTest {
         _mintAndApprove(dai, alice, 1000e18);
         vm.prank(alice);
         uint256 shares = vault.deposit(address(dai), 100e18, carol);
-        assertEq(shares, 100e6);
+        assertEq(shares, 100e6 * VIRTUAL_SHARES);
         assertEq(vault.balanceOf(alice), 0);
-        assertEq(vault.balanceOf(carol), 100e6);
+        assertEq(vault.balanceOf(carol), shares);
         assertEq(dai.balanceOf(address(vault)), 100e18);
         (uint256 amount,) = vault.deposits(carol);
         assertEq(amount, 100e6);
@@ -1163,9 +1262,12 @@ contract VaultErc4626StandardTest is VaultTest {
         _mintAndApprove(usdc, alice, 100e6);
         vm.prank(alice);
         uint256 assets = vault.mint(50e6, carol);
-        assertEq(assets, 50e6);
+        // With the virtual-share offset an empty vault prices `shares` at 10**6 per underlying
+        // unit, so minting 50e6 shares costs 50 underlying units.
+        assertEq(assets, vault.previewMint(50e6));
+        assertEq(assets, 50e6 / VIRTUAL_SHARES);
         assertEq(vault.balanceOf(carol), 50e6);
-        assertEq(usdc.balanceOf(address(vault)), 50e6);
+        assertEq(usdc.balanceOf(address(vault)), assets);
     }
 
     function test_mint_zeroShares_reverts() public {
@@ -1203,8 +1305,9 @@ contract VaultErc4626StandardTest is VaultTest {
         _mintAndApprove(usdc, alice, 100e6);
         vm.prank(alice);
         vault.deposit(100e6, alice);
+        uint256 shares = vault.balanceOf(alice);
         vm.prank(alice);
-        uint256 assets = vault.redeem(100e6, carol, alice);
+        uint256 assets = vault.redeem(shares, carol, alice);
         assertEq(assets, 100e6);
         assertEq(vault.balanceOf(alice), 0);
         assertEq(usdc.balanceOf(carol), 100e6);
@@ -1214,14 +1317,15 @@ contract VaultErc4626StandardTest is VaultTest {
         _mintAndApprove(usdc, alice, 100e6);
         vm.prank(alice);
         vault.deposit(100e6, alice);
+        uint256 shares = vault.balanceOf(alice);
         vm.prank(bob);
         vm.expectRevert(); // ERC20InsufficientAllowance
-        vault.redeem(100e6, bob, alice);
+        vault.redeem(shares, bob, alice);
 
         vm.prank(alice);
-        vault.approve(bob, 100e6);
+        vault.approve(bob, shares);
         vm.prank(bob);
-        vault.redeem(100e6, bob, alice);
+        vault.redeem(shares, bob, alice);
         assertEq(usdc.balanceOf(bob), 100e6);
         assertEq(vault.allowance(alice, bob), 0);
     }
@@ -1230,11 +1334,12 @@ contract VaultErc4626StandardTest is VaultTest {
         _mintAndApprove(usdc, alice, 100e6);
         vm.prank(alice);
         vault.deposit(100e6, alice);
+        uint256 shares = vault.previewWithdraw(50e6);
         vm.prank(alice);
-        vault.approve(bob, 50e6);
+        vault.approve(bob, shares);
         vm.prank(bob);
         uint256 burned = vault.withdraw(50e6, bob, alice);
-        assertEq(burned, 50e6);
+        assertEq(burned, shares);
         assertEq(usdc.balanceOf(bob), 50e6);
         assertEq(vault.allowance(alice, bob), 0);
     }
@@ -1265,8 +1370,9 @@ contract VaultErc4626TimelockTest is VaultTest {
         );
         vault.withdraw(50e6, bob, alice);
         vm.warp(block.timestamp + 1 hours);
+        uint256 sharesForWithdraw = vault.previewWithdraw(50e6);
         vm.prank(alice);
-        vault.approve(bob, 50e6);
+        vault.approve(bob, sharesForWithdraw);
         vm.prank(bob);
         vault.withdraw(50e6, bob, alice);
         assertEq(usdc.balanceOf(bob), 50e6);
@@ -1284,6 +1390,43 @@ contract VaultErc4626TimelockTest is VaultTest {
         (, uint256 afterTs) = vault.deposits(carol);
         assertEq(afterTs, lockedAt, "donation must not extend the receiver's lock");
         assertGt(vault.balanceOf(carol), 100e6);
+    }
+
+    function test_donation_toUnlockedReceiver_doesNotRestartLock() public {
+        vault = _deployVault(usdc, feedUsdc, 1 hours);
+        _mintAndApprove(usdc, alice, 100e6);
+        vm.prank(alice);
+        vault.deposit(100e6, alice);
+        vm.warp(block.timestamp + 1 hours); // alice is now unlocked
+        (, uint256 unlockedAt) = vault.deposits(alice);
+        _mintAndApprove(usdc, bob, 1);
+        vm.prank(bob);
+        vault.deposit(1, alice);
+        (, uint256 afterTs) = vault.deposits(alice);
+        assertEq(afterTs, unlockedAt, "donation must not re-lock the receiver");
+        uint256 shares = vault.balanceOf(alice);
+        vm.prank(alice);
+        vault.redeem(shares, alice, alice); // must not revert
+    }
+
+    function test_selfDeposit_restartsLockWhenUnlocked() public {
+        vault = _deployVault(usdc, feedUsdc, 1 hours);
+        _mintAndApprove(usdc, alice, 200e6);
+        vm.prank(alice);
+        vault.deposit(100e6, alice);
+        vm.warp(block.timestamp + 1 hours); // unlocked
+        vm.prank(alice);
+        vault.deposit(100e6, alice); // own deposit restarts the lock
+        uint256 shares = vault.balanceOf(alice);
+        vm.prank(alice);
+        vm.expectRevert(
+            abi.encodeWithSelector(TokenizedVault.VaultTimelockNotExpired.selector, block.timestamp + 1 hours)
+        );
+        vault.redeem(shares, alice, alice);
+        vm.warp(block.timestamp + 1 hours);
+        vm.prank(alice);
+        vault.redeem(shares, alice, alice);
+        assertEq(usdc.balanceOf(alice), 200e6);
     }
 }
 
@@ -1374,7 +1517,7 @@ contract VaultPausableTest is VaultTest {
         _mintAndApprove(usdc, alice, 100e6);
         vm.prank(alice);
         uint256 shares = vault.deposit(100e6, alice);
-        assertEq(shares, 100e6);
+        assertEq(shares, 100e6 * VIRTUAL_SHARES);
     }
 
     function test_adminConfig_availableWhilePaused() public {
@@ -1414,7 +1557,7 @@ contract VaultMinimumDepositTest is VaultTest {
         _mintAndApprove(usdc, alice, 1000e6);
         vm.prank(alice);
         uint256 shares = vault.deposit(address(usdc), MIN_DEPOSIT, alice);
-        assertEq(shares, MIN_DEPOSIT);
+        assertEq(shares, MIN_DEPOSIT * VIRTUAL_SHARES);
     }
 
     function test_deposit_standard_revertsBelowMinimum() public {
@@ -1456,7 +1599,7 @@ contract VaultMinimumDepositTest is VaultTest {
         _mintAndApprove(usdc, alice, 1000e6);
         vm.prank(alice);
         uint256 shares = vault.deposit(address(usdc), 1e6, alice);
-        assertEq(shares, 1e6);
+        assertEq(shares, 1e6 * VIRTUAL_SHARES);
     }
 }
 
@@ -1538,8 +1681,7 @@ contract VaultWithdrawalFeeTest is VaultTest {
 
     function test_withdrawalFee_setViaInitialize() public {
         bytes memory initData = abi.encodeCall(
-            TokenizedVault.initialize,
-            (address(this), address(usdc), "AV", "AV", address(feedUsdc), 0, 0, 250)
+            TokenizedVault.initialize, (address(this), address(usdc), "AV", "AV", address(feedUsdc), 0, 0, 250)
         );
         address proxy = factory.deployProxy(keccak256("fee-init"), initData);
         TokenizedVault v = TokenizedVault(payable(proxy));
@@ -1549,8 +1691,7 @@ contract VaultWithdrawalFeeTest is VaultTest {
 
     function test_initialize_rejectsFeeAboveDenominator() public {
         bytes memory initData = abi.encodeCall(
-            TokenizedVault.initialize,
-            (address(this), address(usdc), "AV", "AV", address(feedUsdc), 0, 0, 10_001)
+            TokenizedVault.initialize, (address(this), address(usdc), "AV", "AV", address(feedUsdc), 0, 0, 10_001)
         );
         vm.expectRevert(TokenizedVault.VaultInvalidFee.selector);
         factory.deployProxy(keccak256("fee-bad-init"), initData);
@@ -1563,7 +1704,7 @@ contract VaultWithdrawalFeeTest is VaultTest {
         vault.setWithdrawalFee(500); // 5%
         vm.prank(alice);
         uint256 shares = vault.withdraw(1_000e6, alice, alice);
-        assertEq(shares, 1_000e6);
+        assertEq(shares, 1_000e6 * VIRTUAL_SHARES);
         assertEq(usdc.balanceOf(alice), 950e6); // fee deducted from payout
         assertEq(usdc.balanceOf(bob), 50e6); // fee forwarded to the fee collector
         assertEq(usdc.balanceOf(address(vault)), 9_000e6);
@@ -1686,8 +1827,9 @@ contract VaultWithdrawalFeeTest is VaultTest {
         _mintAndApprove(usdc, alice, 1_000e6);
         vm.prank(alice);
         vault.deposit(1_000e6, alice);
+        uint256 shares = vault.balanceOf(alice);
         vm.prank(alice);
-        uint256 received = vault.redeem(1_000e6, alice, alice);
+        uint256 received = vault.redeem(shares, alice, alice);
         assertEq(received, 1_000e6);
         assertEq(usdc.balanceOf(bob), 0);
     }
@@ -1708,5 +1850,146 @@ contract VaultWithdrawalFeeTest is VaultTest {
     function test_setFeeCollector_revertsForZeroAddress() public {
         vm.expectRevert(abi.encodeWithSelector(TokenizedVault.VaultZeroAddress.selector, address(0)));
         vault.setFeeCollector(address(0));
+    }
+
+    function test_previewRedeem_returnsNetOfFee() public {
+        _mintAndApprove(usdc, alice, 10_000e6);
+        vm.prank(alice);
+        uint256 shares = vault.deposit(10_000e6, alice);
+        vault.setWithdrawalFee(500); // 5%
+        assertEq(vault.previewRedeem(shares), 9_500e6);
+        assertApproxEqAbs(
+            vault.previewRedeem(shares),
+            10_000e6 - vault.previewWithdraw(10_000e6) / VIRTUAL_SHARES * 500 / 10_000,
+            1,
+            "net preview consistent with gross shares"
+        );
+        vm.prank(alice);
+        uint256 received = vault.redeem(shares, alice, alice);
+        assertEq(received, vault.previewRedeem(shares), "redeem payout matches previewRedeem");
+    }
+
+    function test_previewWithdraw_returnsSharesForGrossRequest() public {
+        _mintAndApprove(usdc, alice, 10_000e6);
+        vm.prank(alice);
+        vault.deposit(10_000e6, alice);
+        vault.setWithdrawalFee(500); // 5%
+        assertEq(vault.previewWithdraw(1_000e6), 1_000e6 * VIRTUAL_SHARES);
+        vm.prank(alice);
+        uint256 shares = vault.withdraw(1_000e6, alice, alice);
+        assertEq(shares, vault.previewWithdraw(1_000e6), "withdraw burn matches previewWithdraw");
+    }
+
+    function test_maxWithdrawAndMaxRedeem_positiveWithFee() public {
+        _mintAndApprove(usdc, alice, 10_000e6);
+        vm.prank(alice);
+        vault.deposit(10_000e6, alice);
+        vault.setWithdrawalFee(500); // 5%
+        assertEq(vault.maxWithdraw(alice), 10_000e6);
+        assertEq(vault.maxRedeem(alice), vault.balanceOf(alice));
+        uint256 maxAssets = vault.maxWithdraw(alice);
+        vm.prank(alice);
+        vault.withdraw(maxAssets, alice, alice); // maxWithdraw must be usable
+    }
+
+    function test_maxWithdrawAndMaxRedeem_zeroWhenFeeEatsBalance() public {
+        _mintAndApprove(usdc, alice, 10_000e6);
+        vm.prank(alice);
+        vault.deposit(10_000e6, alice);
+        vault.setWithdrawalFee(vault.FEE_DENOMINATOR()); // 100%
+        assertEq(vault.maxWithdraw(alice), 0);
+        assertEq(vault.maxRedeem(alice), 0);
+    }
+
+    function test_previewWithdraw_revertsWhenFeeEatsAmount() public {
+        _mintAndApprove(usdc, alice, 10_000e6);
+        vm.prank(alice);
+        vault.deposit(10_000e6, alice);
+        vault.setWithdrawalFee(vault.FEE_DENOMINATOR()); // 100%
+        vm.expectRevert(TokenizedVault.VaultFeeExceedsAssets.selector);
+        vault.previewWithdraw(100e6);
+    }
+
+    function test_previewRedeem_revertsWhenFeeEatsValue() public {
+        _mintAndApprove(usdc, alice, 10_000e6);
+        vm.prank(alice);
+        uint256 shares = vault.deposit(10_000e6, alice);
+        vault.setWithdrawalFee(vault.FEE_DENOMINATOR()); // 100%
+        vm.expectRevert(TokenizedVault.VaultFeeExceedsAssets.selector);
+        vault.previewRedeem(shares);
+    }
+}
+
+contract VaultFeeCollectorRejectTest is VaultTest {
+    function setUp() public override {
+        super.setUp();
+        vault = _deployVault(usdc, feedUsdc, 0);
+    }
+
+    function test_withdraw_succeedsWhenCollectorBlacklisted() public {
+        _mintAndApprove(usdc, alice, 10_000e6);
+        vm.prank(alice);
+        vault.deposit(10_000e6, alice);
+        vault.setWithdrawalFee(500); // 5%
+        vault.setFeeCollector(bob);
+        usdc.blacklist(bob);
+        vm.prank(alice);
+        uint256 shares = vault.withdraw(1_000e6, alice, alice);
+        assertEq(shares, 1_000e6 * VIRTUAL_SHARES, "withdrawal must not revert");
+        assertEq(usdc.balanceOf(alice), 950e6);
+        assertEq(usdc.balanceOf(bob), 0, "blacklisted collector receives nothing");
+        assertEq(usdc.balanceOf(address(vault)), 9_050e6, "retained fee stays in the vault");
+    }
+
+    function test_redeem_succeedsWhenCollectorBlacklisted() public {
+        _mintAndApprove(usdc, alice, 10_000e6);
+        vm.prank(alice);
+        uint256 shares = vault.deposit(10_000e6, alice);
+        vault.setWithdrawalFee(500); // 5%
+        vault.setFeeCollector(bob);
+        usdc.blacklist(bob);
+        vm.prank(alice);
+        uint256 received = vault.redeem(shares, alice, alice);
+        assertEq(received, 9_500e6, "redeem must not revert");
+        assertEq(usdc.balanceOf(alice), 9_500e6);
+        assertEq(usdc.balanceOf(bob), 0);
+        assertEq(usdc.balanceOf(address(vault)), 500e6, "retained fee stays in the vault");
+    }
+
+    function test_withdraw_feeCollectionResumesAfterUnblacklist() public {
+        _mintAndApprove(usdc, alice, 10_000e6);
+        vm.prank(alice);
+        vault.deposit(10_000e6, alice);
+        vault.setWithdrawalFee(500); // 5%
+        vault.setFeeCollector(bob);
+        usdc.blacklist(bob);
+        vm.prank(alice);
+        vault.withdraw(1_000e6, alice, alice);
+        assertEq(usdc.balanceOf(bob), 0, "first fee retained while blacklisted");
+        usdc.unblacklist(bob);
+        vm.prank(alice);
+        vault.withdraw(1_000e6, alice, alice);
+        assertEq(usdc.balanceOf(alice), 1_900e6);
+        assertEq(usdc.balanceOf(bob), 50e6, "second fee forwarded once collector works");
+        assertEq(usdc.balanceOf(address(vault)), 8_050e6, "first retained fee is never lost");
+    }
+}
+
+contract VaultTotalAssetsFeedTest is VaultTest {
+    function setUp() public override {
+        super.setUp();
+        vault = _deployVault(usdc, feedUsdc, 0);
+    }
+
+    function test_totalAssets_ignoresStaleUnderlyingFeedWhenNoEnabledTokens() public {
+        _mintAndApprove(usdc, alice, 1_000e6);
+        vm.prank(alice);
+        vault.deposit(1_000e6, alice);
+        feedUsdc.setUpdatedAt(0); // stale
+        assertEq(vault.totalAssets(), 1_000e6, "no price feed read without enabled tokens");
+        uint256 shares = vault.balanceOf(alice);
+        vm.prank(alice);
+        uint256 received = vault.redeem(shares, alice, alice);
+        assertEq(received, 1_000e6, "single-asset withdrawals do not depend on the feed");
     }
 }

@@ -20,8 +20,9 @@
 ## What it is
 
 An upgradeable tokenized vault implementing [ERC-4626](https://eips.ethereum.org/EIPS/eip-4626). Depositors exchange
-the underlying ERC-20 asset — or any owner-enabled token valued through Chainlink price feeds — for vault shares, which
-they can redeem back for the underlying asset. The underlying asset is fixed at deployment and cannot be changed.
+the underlying ERC-20 asset — or any owner-enabled token valued through Chainlink price feeds — for non-transferable
+vault shares, which they can redeem for a pro-rata slice of the vault's underlying and enabled-token holdings. The
+underlying asset is fixed at deployment and cannot be changed.
 
 The vault is deployed behind an ERC-1967 transparent proxy and is owned through a 2-step ownership transfer. The owner
 can pause deposits/withdrawals during emergencies, set an opt-in withdrawal timelock, set a minimum deposit amount, set
@@ -34,28 +35,29 @@ a withdrawal fee and manage the set of enabled tokens.
 - **Multi-token deposits** — the underlying asset is always accepted; any other token must be enabled by the owner with
   a Chainlink USD price feed and is valued against the underlying via `getTokenValue`.
 - **Price feed safety** — feeds are checked for staleness (1-day heartbeat), non-positive answers and round integrity;
-  deposits and redemptions revert if a feed is not fresh.
+  deposits of a token and any operation that values the vault's holdings revert if the respective feed is not fresh.
 - **Proportional basket payouts** — every withdraw/redeem is paid as a pro-rata slice of the vault's holdings: the
   underlying asset plus each enabled token currently held. A vault that holds only the underlying pays out purely in
   it; a vault holding enabled tokens stays fully liquid even with no underlying reserves. The withdrawal fee (if set)
   is collected as the same pro-rata basket.
-
 - **Virtual-share inflation protection** — a fixed internal share offset guarantees the first depositor cannot be
   rounded to zero when a vault is seeded by a donation; shares always have at least the virtual-share value, which feeds
   into the ERC-4626 conversions and `preview*`/`max*` functions.
-
 - **Held tokens cannot be disabled** — `disableToken` reverts while the vault still holds a balance of that token,
   preventing the vault from silently dropping coverage of an asset it has not fully paid out.
 - **Non-transferable receipt tokens** — `transfer` and `transferFrom` always revert; a third party may only
   withdraw/redeem someone's shares through an ERC-20 allowance.
 - **Withdrawal timelock** — per-account lock (in seconds) configurable by the owner; `0` means instant withdrawals.
+  Third-party and donation deposits never start, extend or restart a receiver's lock; only the receiver's own deposit
+  after the lock has expired restarts it.
 - **Withdrawal fee** — configurable fee in basis points charged on every withdraw and redeem; the fee is deducted
   from the payout and forwarded to the `feeCollector` (defaults to the owner). Both are owner-settable. If the
   collector cannot receive the asset, the fee stays in the vault rather than blocking the withdrawal. `preview*`
   and `max*` are fee-aware.
 - **Pausable** — the owner can pause and unpause the vault; while paused, no deposits, withdrawals or share mint/burn.
 - **Reentrancy protected** — all deposit/withdraw entry points and token/fee administration are `nonReentrant`.
-- **No Ether accepted** — `receive` and `fallback` revert.
+- **No Ether accepted** — the proxy forwards Ether (with or without calldata) to the implementation, whose `receive`
+  and `fallback` always revert (`VaultEtherNotAccepted`).
 - **Upgradeable** — ERC-1967 transparent proxy, deployed at a predictable CREATE2 address through a proxy factory, with
   a 2-step-ownable proxy admin.
 
@@ -66,7 +68,7 @@ All contracts live in `src/vault/`:
 | Contract | Description |
 | --- | --- |
 | `TokenizedVault.sol` | The vault implementation: ERC-4626 vault, enabled-token deposits, timelock, minimum deposit, withdrawal fee, pause. |
-| `VaultTransparentProxy.sol` | ERC-1967 transparent proxy. Its immutable admin can only call `upgradeToAndCall`. |
+| `VaultTransparentProxy.sol` | ERC-1967 transparent proxy. Its immutable admin can only call `upgradeToAndCall`; Ether with or without calldata is forwarded to the implementation. |
 | `IVaultTransparentProxy.sol` | Interface for the transparent proxy (`admin`, `implementation`, `upgradeToAndCall`). |
 | `VaultProxyAdmin.sol` | 2-step ownable admin that lets its owner upgrade vault proxies. |
 | `ProxyFactory.sol` | 2-step ownable factory that deploys proxies at predictable CREATE2 addresses. |

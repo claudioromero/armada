@@ -55,6 +55,15 @@ contract VaultTransparentProxy is ERC1967Proxy {
         return _proxyAdmin();
     }
 
+    /// @notice Handles Ether received with empty calldata.
+    /// @dev Forwards plain Ether transfers to the implementation exactly like data-carrying
+    ///      fallback calls, so the same transparent-admin guard and implementation dispatch
+    ///      apply. An admin sending Ether without calldata is denied (`ProxyDeniedAdminAccess`),
+    ///      and Ether is accepted only if the implementation accepts it.
+    receive() external payable virtual {
+        _fallback();
+    }
+
     /// @notice Handles calls not resolved by the proxy's own functions.
     /// @dev The admin may only call `upgradeToAndCall`; any other call reverts. All other
     ///      callers are forwarded to the implementation.

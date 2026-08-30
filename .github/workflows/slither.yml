@@ -1,0 +1,51 @@
+name: Slither Analysis
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+        branches: [main]
+
+jobs:
+    analyze:
+        name: Slither Static Analysis
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            security-events: write
+            actions: read
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+              with:
+                  submodules: recursive
+
+            - name: Install Foundry
+              uses: foundry-rs/foundry-toolchain@v1
+              with:
+                  version: nightly
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: "20"
+                  cache: "npm"
+
+            - name: Install dependencies
+              run: npm ci
+
+            - name: Run Slither
+              uses: crytic/slither-action@v0.4.0
+              id: slither
+              with:
+                  fail-on: none
+                  sarif: results.sarif
+                  slither-args: --filter-paths "node_modules|lib|test" --exclude-dependencies
+
+            - name: Upload SARIF file
+              uses: github/codeql-action/upload-sarif@v4
+              # Continue if Code Security isn't enabled for this repo
+              continue-on-error: true
+              with:
+                  sarif_file: results.sarif

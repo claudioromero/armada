@@ -1,6 +1,6 @@
-## Managed ERC-20 token - Example
+## Tokenized vault
 
-**Managed ERC-20 token that can be upgraded via ERC-1967**
+**Upgradeable, ownable (2-step) and pausable ERC-20 vault that issues shares backed by a single underlying ERC-20 asset.**
 
 
 ## Highliths
@@ -8,40 +8,90 @@
 * Fully tested. Production grade.
     * Code coverage report in place.
     * Unit tests in place.
+    * Github workflow in place.
 
 * Code strength.
-    * [Static] Code & vulnerabilities analysis handled by Slither
-    * [AI] Dynamic code analysis handled by Cursor and Claude.
+    * Static code vulnerabilities analysis handled by Slither.
+    * Dynamic code analysis handled by Cursor.
 
 * Well documented code.
     * [Docs] Documentation available in the docs folder for end users.
     * [Docs] Documentation can be generated automatically by running `npm run docs`
 
-* Code flattening in place, for further deployment. (see flat folder)
+* Flattened contracts located in the "/flat" directory.
+* ABIs located in the "/abi" directory.
 
 ## Documentation
 
-A managed ERC-20 token that can be upgraded via ERC-1967.
-The circulating supply is controlled by a specific minter and burner, for the sake of demo.
+An upgradeable, ownable (2-step) and pausable ERC-20 tokenized vault. Depositors exchange the underlying ERC-20 asset
+for vault shares, which they can redeem back for the underlying asset at any time. The underlying asset is fixed at
+deployment and cannot be changed. Deposits and withdrawals can be paused by the owner, and the owner can set opt-in
+deposit and withdrawal fees, as well as sweep untracked assets.
 
 ## Usage
 
 ### Build
 
 ```shell
-$ forge build
+forge build
 ```
 
-### Test
+### Local Testing
 
 ```shell
-$ forge test
+forge test
 ```
 
-
-### Deploy
+### Generate test coverage report:
 
 ```shell
-$ forge script script/ManagedErc20.s.sol:ManagedErc20Script --rpc-url <your_rpc_url> --private-key <your_private_key>
+npm run coverage
 ```
+
+### Static code analysis report:
+
+```shell
+npm run slither
+```
+
+or
+
+```shell
+slither .
+```
+
+### Testing on the Ethereum MainNet
+
+```shell
+npm run test-main
+```
+
+### Testing on Arbitrum
+
+```shell
+npm run test-arb
+```
+
+### Testing on Binance
+
+```shell
+npm run test-binance
+```
+
+### Testing on Avalanche
+
+```shell
+npm run test-avalanche
+```
+
+### Testing on Optimism
+
+```shell
+npm run test-opti
+```
+
+### Deploy / test the vault
+
+The vault is defined in `src/tokens/TokenizedVault.sol` and deployed through the deployment script
+(`script/TokenizedVault.s.sol`). Refer to the unit tests (`test/`) for usage examples.
 

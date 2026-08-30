@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Armada - Smart Contracts",
   "author": "Claudio Romero",
-  "license": "MIT",
+  "license": "BUSL-1.1",
   "engines": {
     "node": ">= 16.14.2"
   },
